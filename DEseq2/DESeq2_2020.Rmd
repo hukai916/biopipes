@@ -1,0 +1,566 @@
+---
+title: "RNA-seq analysis with DEseq2"
+author: "Rui Li, Kai Hu"
+date: "03/04/2020"
+output:
+  html_document:
+    toc: yes
+    code_folding: hide
+    toc_float: yes
+---
+
+# **Reports**
+"Normalization.xlsx" -> counts, TPM, FPKM information <br>
+"\<contrast_name>.rnk" -> genes ranked by log2FoldChange_shrink <br>
+"\<contrast_name>.rnk" -> for GSEA analysis <br>
+"\<contrast_name>.deseq2.xlsx" -> raw DESeq2 output <br>
+"\<contrast_name>.deseq2.sig.FDR.\<x>.LFC.\<x>.xlsx" -> significant DESeq2 output <br>
+"\<contrast_name>.deseq2.csv" -> for developers 
+
+# **Step0:** load required modules and functions
+**load dataClean**
+```{r message = FALSE}
+library(dplyr)
+
+dataClean <- function(feature_count_table, count = 10) {
+  df <- read.table(feature_count_table, 
+                   sep = '\t',
+                   header = TRUE,
+                   row.names = 1)
+  # Rename colnames:
+  col_name <- gsub('.bam$', '', colnames(df))
+  col_name <- gsub('^sorted_reads.', '', col_name)
+  colnames(df) <- col_name
+  
+  # Filter out rows with low expression:
+  matrix_cts <- df[, 6:ncol(df)] %>% as.matrix()
+  expressionFilter <- rowSums(matrix_cts) >= count # note can't be: rowSums(matrix_cts >= count)
+  df <- df[expressionFilter, ]
+  matrix_cts <- matrix_cts[expressionFilter, ]
+  return(list(df, matrix_cts))
+}
+```
+
+**load getAnnotation**
+```{r message = FALSE}
+getAnnotation <- function(urlpath) {
+  tmp <- tempfile()
+  download.file(urlpath, destfile = tmp, method = 'auto')
+  return(read.table(tmp, header = TRUE))
+}
+```
+
+**load getNormalization**
+```{r message = FALSE}
+library(WriteXLS)
+library(scater)
+
+getNormalization <- function(df, annoFile) {
+#Raw counts
+df_cts <- df[, 6:ncol(df)]
+colnames(df_cts) <- paste(colnames(df_cts), 'COUNT', sep = ':')
+output_df_count <- merge(annoFile, df_cts,
+                         by.x = 1, by.y = 0, 
+                         all.y = TRUE, sort = FALSE)
+
+#Normalize to TPM
+matrix_tpm <- calculateTPM(df_cts, lengths = df$Length)
+colnames(matrix_tpm) <- paste(colnames(matrix_tpm), 'TPM', sep = ':')
+output_df_tpm <- merge(annoFile, matrix_tpm, 
+                      by.x = 1, by.y = 0,
+                      all.y = TRUE, sort = FALSE)
+#Normalize to FPKM
+matrix_fpkm <- calculateFPKM(df_cts, lengths = df$Length)
+colnames(matrix_fpkm) <- paste(colnames(matrix_fpkm), 'FPKM', sep = ':')
+output_df_fpkm <- merge(annoFile, matrix_fpkm, 
+                      by.x = 1, by.y = 0,
+                      all.y = TRUE, sort = FALSE)
+
+#Ouput the above into one single excel file
+sheets <- list(output_df_count, output_df_tpm, output_df_fpkm)
+sheets_name <- c('COUNT', 'TPM', 'FPKM')
+WriteXLS(x = sheets, 
+         ExcelFileName = 'Normalization.xlsx', 
+         row.names = FALSE,
+         SheetNames = sheets_name,
+         na = '-')
+}
+```
+
+**load fitDESeq**
+```{r message = FALSE}
+library(dplyr)
+library(DESeq2)
+
+fitDESeq <- function(df) {
+matrix_cts <- df[, 6:ncol(df)] %>% as.matrix()
+sample_name <- factor(colnames(matrix_cts))
+
+#Determine the batch info:
+sample_batch <- factor(regmatches(sample_name, regexpr('batch(_|\\.|-)*[0-9]+', sample_name, ignore.case = TRUE)))
+if (length(sample_batch) == 0) sample_batch <- factor(rep('batch1', length(sample_name)))
+#Determine sample condition info:
+tmp_no_batch <- gsub('(_|-|\\.)batch(_|\\.|-)*[0-9]+', '', sample_name, ignore.case = TRUE) 
+sample_condition <- factor(gsub('.[0-9]+$', '', tmp_no_batch)) # doesn't need to be factor, need to verity this
+res_design <- data.frame(sample_name, sample_condition, sample_batch)
+
+#Prepare DESeq input files:
+coldata <- data.frame(row.names = sample_name,
+                      sample_condition,
+                      sample_batch)
+#Fit one big model into DESeq:
+dds <- DESeqDataSetFromMatrix(countData = matrix_cts,
+                              colData = coldata,
+                              design = ~ sample_condition)
+dds <- DESeq(dds) # without considering batch effect
+saveRDS(dds, file = 'raw.dds.rds')
+return(list(dds, res_design))
+}
+
+```
+
+**load plotQC_PCA**
+```{r}
+plotQC_PCA <- function(dds) {
+  vsd <- vst(dds, blind = FALSE) # must transform data first for plotting purpose
+
+  pcaData <- plotPCA(vsd, intgroup = 'sample_condition', returnData=TRUE)
+  percentVar <- round(100 * attr(pcaData, 'percentVar'))
+  
+  sample_condition <- dds$sample_condition
+  sample_batch <- dds$sample_batch
+  
+  ggplot(pcaData, aes(PC1, PC2, color = sample_condition, shape = sample_condition)) +
+  geom_point(size = 3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  geom_label_repel(aes(label = paste(sample_condition, sample_batch, sep = '_')),
+                    box.padding = 0.35,
+                    point.padding = 0.5,
+                    segment.color = 'grey50',
+                    show.legend = FALSE) + # if TRUE, legend display might not be correct
+  theme_classic()
+}
+```
+
+**load plotQC_cluster**
+```{r}
+plotQC_cluster <- function(dds) {
+library(RColorBrewer)
+library(dplyr)
+library(pheatmap)
+
+vsd <- vst(dds, blind = FALSE) # must transform data first for plotting purpose
+
+sampleDists <- dist(t(assay(vsd)))
+sampleDistMatrix <- sampleDists %>% as.matrix()
+rownames(sampleDistMatrix) <- paste(vsd$sample_condition, vsd$sample_batch, sep = '_')
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors)
+}
+```
+
+**load plotQC_correlation**
+```{r}
+plotQC_correlation <- function(dds) {
+library(gtools)
+
+matrix_cts <- counts(dds)
+matrix_pair <- combinations(ncol(matrix_cts), 2, v = colnames(matrix_cts), repeats.allowed = FALSE)
+res_df <- data.frame(sample1 = character(), sample2 = character(), cor.test.score = double())
+for (i in 1:nrow(matrix_pair)) {
+  res <- cor.test(matrix_cts[, matrix_pair[i, 1]], matrix_cts[, matrix_pair[i, 2]])
+  row <- data.frame('sample1' = matrix_pair[i, 1], 
+                    'sample2' = matrix_pair[i, 2], 
+                    'cor.test.score' = as.numeric(res$estimate[[1]]))
+  res_df <- rbind(res_df, row)
+}
+return(res_df)
+}
+```
+
+**load summaryRes (Contrast)**
+```{r}
+summaryRes <- function(res, contrast_name = '', cutoff_pvalue = 0.05, cutoff_LFC = 1) {
+  sig_idx <- res$padj < cutoff_pvalue & abs(res$log2FoldChange) > cutoff_LFC
+  sig_idx[is.na(sig_idx)] <- FALSE
+  res_sig <- res[sig_idx, ]
+  
+  up_idx <- res$padj < cutoff_pvalue & res$log2FoldChange > cutoff_LFC
+  up_idx[is.na(up_idx)] <- FALSE
+  res_sig_up <- res[up_idx,]
+
+  down_idx <- res$padj < cutoff_pvalue & res$log2FoldChange < -cutoff_LFC
+  down_idx[is.na(down_idx)] <- FALSE
+  res_sig_down <- res[down_idx,]
+
+  return(list(sig_idx, up_idx, down_idx))
+}
+```
+
+**load plotPvalueDist (Contrast)**
+```{r}
+plotPvalueDist <- function(res, contrast_name) {
+hist(res$pvalue, breaks = 50, col = 'grey', 
+    main = paste("Histogram of p-values (un-adjusted)", contrast_name, sep = '\n'), 
+    xlab = 'P-value', ylab = 'Frequency')
+  
+hist(res$padj, breaks = 50, col = 'grey', 
+    main = paste("Histogram of Q-values (adjusted P-values)", contrast_name, sep = '\n'), 
+    xlab = 'Q-value', ylab = 'Frequency')
+}
+```
+
+**load plotMAFig (Contrast)**
+```{r}
+library(dplyr)
+library(ggplot2)
+
+plotMAFig <- function(res, contrast_name = '', cutoff_pvalue = 0.05, labelsig = FALSE, textcx = 1, ...) {
+with(res, 
+    plot(baseMean, log2FoldChange, 
+        col = 'grey80', pch = 20,
+        cex = .5, main = contrast_name, ...))
+with(subset(res, padj < cutoff_pvalue), 
+    points(baseMean, log2FoldChange, 
+          col = 'grey40', pch = 20,
+          cex = .5))
+if (labelsig) {
+  with(subset(res, padj < cutoff_pvalue),
+      textxy(baseMean, log2FoldChange,
+      labs = Gene, cex = textcx, col = 2))
+  }
+}
+```
+
+**load plotVolcanoFig (Contrast)**
+```{r message = FALSE}
+library(DESeq2)
+library(EnhancedVolcano)
+library(gridExtra)
+library(grid)
+library(dplyr)
+
+plotVolcanoFig <- function(res, xlim = 100, ylim = 1000, contrast_name = contrast_name, cutoff_pvalue = 0.05, cutoff_LFC = 1, annoFile = '') {
+
+res <- results(dds, contrast <- contrast)
+res <- merge(data.frame(res), annoFile, by.x = 0, by.y = 1, sort = FALSE)
+
+#Set up some arbitury xlim and ylim cutoffs
+res$padj[res$padj < 10^(-ylim)] <- 10^(-ylim) 
+res$log2FoldChange[res$log2FoldChange > xlim] <- xlim
+res$log2FoldChange[res$log2FoldChange < -xlim] <- -xlim
+
+subset_positive <- subset(res, padj < cutoff_pvalue & log2FoldChange > cutoff_LFC)
+num_positive <- dim(subset_positive)[1]
+
+subset_negative <- subset(res, padj < cutoff_pvalue & log2FoldChange < -cutoff_LFC)
+num_negative <- dim(subset_negative)[1]
+
+plot_title <- paste("Volcano plot: ", 
+                    contrast_name, 
+                    paste("Up: ", num_positive,
+                          " Down: ", num_negative,
+                          sep = ''),
+                    sep = '\n')
+                    
+cutoff_label <- res$padj[order(res$padj)][100] # set a cutoff for labelling purpose
+
+plot_volcano <- 
+  EnhancedVolcano(res, lab = res$Name,
+                 x = 'log2FoldChange', y = 'padj',
+                 xlab = bquote(~Log[2]~ "Fold Change"),
+                 ylab = bquote(~-Log[10]~ italic(Qvalue)),
+                 title = plot_title,
+                 pCutoff = cutoff_pvalue, FCcutoff = cutoff_LFC,
+                 #pLabellingCutoff = cutoff_label,
+                 cutoffLineType = 'twodash',
+                 cutoffLineWidth = 0.8,
+                 pointSize = 1.0,
+                 labSize = 2.0,
+                 colAlpha = 0.5,
+                 legendLabels = c('Not Significant', 
+                                   paste("|LFC| > ", cutoff_LFC, sep=""),
+                                   paste("Qvalue < ", cutoff_pvalue, sep=""),
+                                   'Both'),
+                 legendPosition = 'right',
+                 legendLabSize = 10,
+                 axisLabSize = 10,
+                 titleLabSize = 10,
+                 legendIconSize = 3.0)
+
+grid.arrange(plot_volcano, ncol = 1,
+             top = textGrob(' ', just = c('center'), 
+                            gp = gpar(fontsize = 32)))
+grid.rect(gp = gpar(fill = NA))
+}
+```
+
+**load analyzeContrast**
+```{r}
+analyzeContrast <- function(res, cutoff_pvalue = 0.05, cutoff_LFC = 1, contrast_name = '', annoFile = '', raw = TRUE) {
+summaryRes(res, contrast_name = contrast_name, cutoff_pvalue = cutoff_pvalue, cutoff_LFC = cutoff_LFC)
+plotPvalueDist(res, contrast_name)
+
+if (raw) {
+  plotMAFig(res, cutoff_qvalue = cutoff_pvalue, main = paste("MA-plot: LFC_raw", contrast_name, sep = '\n'))
+  plotVolcanoFig(res, xlim = 100, ylim = 1000, 
+                 contrast_name = paste(contrast_name, "LFC_raw", sep = '_'),
+                 cutoff_pvalue = cutoff_pvalue,
+                 cutoff_LFC = cutoff_LFC, 
+                 annoFile = annoFile)
+  }
+else {
+  plotMAFig(res, cutoff_qvalue = cutoff_pvalue, main = paste("MA-plot: LFC_shrinked", contrast_name, sep = '\n'))
+  plotVolcanoFig(res, xlim = 100, ylim = 1000, 
+                 contrast_name = paste(contrast_name, "LFC_shrinked", sep = '_'),
+                 cutoff_pvalue = cutoff_pvalue,
+                 cutoff_LFC = cutoff_LFC, 
+                 annoFile = annoFile)
+  }
+}
+```
+**load analyzeContrast**
+```{r}
+generateOutput <- function(df, dds, annoFile) {
+  library(dplyr)
+  library(DESeq2)
+  library(WriteXLS)
+  
+  tpm <- df[, 6:ncol(df)] %>% as.matrix() %>% calculateTPM(, df$Length) %>% data.frame()
+  colnames(tpm) <- paste(colnames(tpm),"TPM",  sep = ":")
+  norm_exp <- tpm
+  
+  res_df <- lfcShrink(dds, contrast = contrast, type = 'ashr') %>% as.data.frame()
+  names(res_df)[2] <- "log2FoldChange_shrinked"
+  names(res_df)[3] <- "lfcSE_shrinked"
+  
+  res2_df <- results(dds, contrast <- contrast) %>% as.data.frame()
+  names(res2_df)[2] <- "log2FoldChange_raw"
+  names(res2_df)[3] <- "lfcSE_raw"
+  res2_df <- res2_df[, c(2,3)]
+  
+  res_df_combine <- merge(res_df, res2_df, by = 0, sort = F, all.x = T) 
+  res_df_combine <- merge(annoFile, res_df_combine, by.x=1, by.y=1, sort=F, all.y=T)
+  res_df_combine <- merge(res_df_combine, norm_exp, by.x=1, by.y=0, all.x=T, sort=F)
+  
+  # For GSEA:
+  rnk <- subset(res_df_combine, select = c('Name', 'log2FoldChange_shrinked'))
+  colnames(rnk) <- c("# Name","log2FoldChange_shrinked")
+  rnk <- rnk[order(rnk$log2FoldChange_shrinked), ]
+  write.table(rnk, 
+              paste(contrast_name, 'rnk', sep = '.'), 
+              row.names = F, quote = F, sep='\t')  
+  # Write out csv for later analysis:
+  write.csv(res_df_combine, row.names = FALSE,
+            file=paste(contrast_name, 'deseq2.csv', sep = '.'))  
+  # Write out xlsx for users:
+  WriteXLS(x = res_df_combine,
+               ExcelFileName = paste(contrast_name, 'deseq2.xlsx', sep = '.'),
+                                     row.names = F, SheetNames = 'sheet1', na = '-')  
+  WriteXLS(x = res_df_combine,
+               ExcelFileName = paste(contrast_name, 'deseq2.sig.FDR', cutoff_pvalue,
+                                     'LFC', cutoff_LFC, 'xlsx', sep = '.'),
+                                     row.names = F, SheetNames = 'sheet1', na = '-')
+}
+```
+
+
+Run codes below:
+
+# **Step1**: preprocess data: feature_count > df
+```{r}
+test_data <- 'test_data/counts.gene_id.s0.strict.txt'
+res <- dataClean(test_data, count = 1) # filter using count value 1
+df <- res[[1]]
+matrix_cts <- res[[2]] # re-calculated in other functions
+```
+
+# **Step2**: read in annotation file
+```{r}
+# from GitHub (must be raw, not zipped)
+url <- 'https://raw.githubusercontent.com/hukai916/Collections/master/gencode.v29.primary_assembly.anno.txt' 
+annoFile <- getAnnotation(url)
+```
+
+# **Step3:** perform normalization (TPM and FPKM)
+```{r}
+getNormalization(df, annoFile)
+```
+Result saved in "Normalization.xlsx"
+
+# **Step4:** prepare and fit DESeq2 model
+**Please double check the experimental design:**
+```{r message = FALSE}
+handler <- fitDESeq(df) # Input ot DESeq2 must be unnormalized counts file
+dds <- handler[[1]]
+res_design <- handler[[2]]
+print(res_design)
+```
+
+# **Step5:** plot QC diagnosis
+## Histogram of Log10(Counts) distribution
+```{r}
+library(DESeq2)
+
+tmp <- log10(counts(dds) + 1)
+hist(tmp, main = 'Histogram of log10(count + 1)', 100) # by default, use non-normalized data by counts function
+```
+
+## Dispersion plot
+```{r}
+plotDispEsts(dds, main = "Dispersion plot")
+```
+
+## PCA plot
+```{r}
+plotQC_PCA(dds)
+```
+
+## Sample clustering heatmap
+```{r}
+plotQC_cluster(dds)
+```
+
+## Sample correlation table
+```{r}
+tmp <- plotQC_correlation(dds)
+print(tmp)
+```
+
+# **Step6:** perform selected DESeq contrast
+## Which contrast? Select:
+```{r}
+levels(colData(dds)$sample_condition)
+```
+
+## **Contrast selected:** "csc_diff" vs "csc"
+```{r}
+cutoff_pvalue <- 0.05
+cutoff_LFC <- 1
+input_condition <- 'csc'
+target_condition <- 'csc_diff'
+contrast <- c('sample_condition', target_condition, input_condition)
+contrast_name <- paste(target_condition, '_VS_', input_condition, '(input)', sep = '')
+```
+
+## **Without shrinking**
+```{r}
+res <- results(dds, contrast = contrast)
+```
+### Summary tables
+#### Using FDR cutoff only
+```{r}
+summary(res, alpha = cutoff_pvalue)
+```
+#### Using FDR and LFC cutoffs
+```{r}
+tmp <- summaryRes(res, contrast_name = contrast_name, cutoff_pvalue = cutoff_pvalue, cutoff_LFC = cutoff_LFC)
+```
+Numer of significant DEGs:
+```{r}
+table(tmp[[1]])
+```
+Number of significantly up-regulated genes:
+```{r}
+table(tmp[[2]])
+```
+Number of significantly down-regulated genes:
+```{r}
+table(tmp[[3]])
+```
+
+### P-value distribution
+```{r}
+plotPvalueDist(res, contrast_name)
+```
+
+### MA-plot
+```{r}
+plotMAFig(res, contrast_name = contrast_name, cutoff_pvalue = cutoff_pvalue, labelsig = FALSE, textcx = 1)
+```
+
+### Volcano-plot
+```{r}
+plotVolcanoFig(res, xlim = 100, ylim = 1000, contrast_name = contrast_name, cutoff_pvalue = cutoff_pvalue, cutoff_LFC = cutoff_LFC, annoFile = annoFile)
+```
+
+## **With shrinking**
+```{r message = FALSE}
+library(ashr)
+
+res <- lfcShrink(dds, contrast = contrast, type = 'ashr')
+```
+### Summary tables
+#### Using FDR cutoff only
+```{r}
+summary(res, alpha = cutoff_pvalue)
+```
+#### Using FDR and LFC cutoffs
+```{r}
+tmp <- summaryRes(res, contrast_name = contrast_name, cutoff_pvalue = cutoff_pvalue, cutoff_LFC = cutoff_LFC)
+```
+Numer of significant DEGs:
+```{r}
+table(tmp[[1]])
+```
+Number of significantly up-regulated genes:
+```{r}
+table(tmp[[2]])
+```
+Number of significantly down-regulated genes:
+```{r}
+table(tmp[[3]])
+```
+
+### P-value distribution
+```{r}
+plotPvalueDist(res, contrast_name)
+```
+
+### MA-plot
+```{r}
+plotMAFig(res, contrast_name = contrast_name, cutoff_pvalue = cutoff_pvalue, labelsig = FALSE, textcx = 1)
+```
+
+### Volcano-plot
+```{r}
+plotVolcanoFig(res, xlim = 100, ylim = 1000, contrast_name = contrast_name, cutoff_pvalue = cutoff_pvalue, cutoff_LFC = cutoff_LFC, annoFile = annoFile)
+```
+
+# **Outputs**
+## "\<contrast_name>.rnk"
+## "\<contrast_name>.deseq2.xlsx"
+## "\<contrast_name>.deseq2.sig.FDR.\<x>.LFC.\<x>.xlsx"
+## "\<contrast_name>.deseq2.csv"
+```{r message = FALSE}
+generateOutput(df, dds, annoFile)
+```
+
+# Package list
+```{r}
+(.packages())
+sessionInfo()
+```
+
+
+
+<!-- To be implemented ..
+
+#Control for Batch effect if more than 1 batch detected
+batch_num <- colData(dds)$sample_batch %>% levels() %>% length()
+if (batch_num > 1) {
+design(dds) <- formula(~ sample_batch + sample_condition)
+ddsBatch <- DESeq(dds)
+resBatch <- results(ddsBatch, contrast = c('sample_condition', X1, X2))
+}
+
+design(dds) <- formula(~ sample_batch + sample_condition)
+ddsBatch <- DESeq(dds)
+
+#sample_name <- c('csc_1806_batch1_1','csc_1806_batch1_1','csc_1806_batch2_1','csc_1806_batch2_1','csc_1806_batch2_2','csc_1806_batch2_2','non_csc_1806_batch1_1','non_csc_1806_batch1_1','non_csc_1806_batch1_2','non_csc_1806_batch1_2')
+-->
