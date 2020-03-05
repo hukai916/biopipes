@@ -1,0 +1,6 @@
+DESeq2/*.xlsx
+DESeq2/*.csv
+DESeq2/*.rnk
+DESeq2/*.html
+DESeq2/test_data
+DESeq2/*.rds
