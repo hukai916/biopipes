@@ -4,3 +4,6 @@ DESeq2/*.rnk
 DESeq2/*.html
 DESeq2/test_data
 DESeq2/*.rds
+.gitignore
+todel
+.DS_Store
