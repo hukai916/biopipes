@@ -19,6 +19,12 @@ output:
 
 # **Step0:** load required modules and functions
 **load dataClean**
+<br>**input:**<br>
+feature_count_table<br>
+cutoff_count<br>
+**output:**<br> 
+df (column renamed, filterd out rows below cutoff_count)<br>
+matrix_cts
 ```{r message = FALSE}
 library(dplyr)
 
@@ -42,6 +48,10 @@ dataClean <- function(feature_count_table, count = 10) {
 ```
 
 **load getAnnotation**
+<br>**input:**<br>
+GitHub link to annotation file<br>
+**output:**<br>
+annFile (annotation table)
 ```{r message = FALSE}
 getAnnotation <- function(urlpath) {
   tmp <- tempfile()
@@ -51,6 +61,11 @@ getAnnotation <- function(urlpath) {
 ```
 
 **load getNormalization**
+<br>**input:**<br>
+df<br>
+annoFile<br>
+**output:**<br> 
+"Normalization.xlsx" (normalized counts using TPM and FPKM)
 ```{r message = FALSE}
 library(WriteXLS)
 library(scater)
@@ -61,7 +76,7 @@ df_cts <- df[, 6:ncol(df)]
 colnames(df_cts) <- paste(colnames(df_cts), 'COUNT', sep = ':')
 output_df_count <- merge(annoFile, df_cts,
                          by.x = 1, by.y = 0, 
-                         all.y = TRUE, sort = FALSE)
+                         all.y = TRUE, sort = FALSE) # by.x = 1, which refers to 'Name', by.y = 0, which refers to row_names (GeneID)
 
 #Normalize to TPM
 matrix_tpm <- calculateTPM(df_cts, lengths = df$Length)
@@ -88,6 +103,12 @@ WriteXLS(x = sheets,
 ```
 
 **load fitDESeq**
+<br>**input:**<br>
+df<br>
+**output:**<br> 
+dds (fitted DESeq model)<br>
+res_design (extracted experimental design)<br>
+'raw.dds.rds'
 ```{r message = FALSE}
 library(dplyr)
 library(DESeq2)
@@ -116,10 +137,13 @@ dds <- DESeq(dds) # without considering batch effect
 saveRDS(dds, file = 'raw.dds.rds')
 return(list(dds, res_design))
 }
-
 ```
 
 **load plotQC_PCA**
+<br>**input:**<br>
+dds<br>
+**output:**<br> 
+PCA plot
 ```{r}
 plotQC_PCA <- function(dds) {
   vsd <- vst(dds, blind = FALSE) # must transform data first for plotting purpose
@@ -144,6 +168,9 @@ plotQC_PCA <- function(dds) {
 ```
 
 **load plotQC_cluster**
+<br>**input:**<br>
+dds<br>
+**output:**<br>clustering heatmap
 ```{r}
 plotQC_cluster <- function(dds) {
 library(RColorBrewer)
@@ -165,6 +192,10 @@ pheatmap(sampleDistMatrix,
 ```
 
 **load plotQC_correlation**
+<br>**input:**<br>
+dds<br>
+**output:**<br>
+res_df (sample correlation matrix)
 ```{r}
 plotQC_correlation <- function(dds) {
 library(gtools)
@@ -184,6 +215,15 @@ return(res_df)
 ```
 
 **load summaryRes (Contrast)**
+<br>**input:**<br>
+res (result from DESeq2)<br>
+contrast_name (XXX_VS_XXX)<br>
+cutoff_pvalue<br>
+cutoff_LFC<br>
+**output:**<br> 
+sig_idx (table of significant DEGs)<br>
+up_idx (table of significantly up-regulated genes)<br>
+down_idx (table of significantly down-regulated genes)
 ```{r}
 summaryRes <- function(res, contrast_name = '', cutoff_pvalue = 0.05, cutoff_LFC = 1) {
   sig_idx <- res$padj < cutoff_pvalue & abs(res$log2FoldChange) > cutoff_LFC
@@ -203,6 +243,10 @@ summaryRes <- function(res, contrast_name = '', cutoff_pvalue = 0.05, cutoff_LFC
 ```
 
 **load plotPvalueDist (Contrast)**
+<br>**input:**<br>
+res<br>
+contrast_name<br>
+**output:**<br> histogram of Pvalue distribution
 ```{r}
 plotPvalueDist <- function(res, contrast_name) {
 hist(res$pvalue, breaks = 50, col = 'grey', 
@@ -216,6 +260,12 @@ hist(res$padj, breaks = 50, col = 'grey',
 ```
 
 **load plotMAFig (Contrast)**
+<br>**input:**<br>
+res<br>
+contrast_name<br>
+cutoff_pvalue<br>
+**output:**<br>
+MA plot
 ```{r}
 library(dplyr)
 library(ggplot2)
@@ -238,6 +288,14 @@ if (labelsig) {
 ```
 
 **load plotVolcanoFig (Contrast)**
+<br>**input:**<br>
+res<br>
+contrast_name<br>
+cutoff_pvalue<br>
+cutoff_LFC<br>
+annFile<br>
+**output:**<br> 
+volcano plot
 ```{r message = FALSE}
 library(DESeq2)
 library(EnhancedVolcano)
@@ -248,7 +306,7 @@ library(dplyr)
 plotVolcanoFig <- function(res, xlim = 100, ylim = 1000, contrast_name = contrast_name, cutoff_pvalue = 0.05, cutoff_LFC = 1, annoFile = '') {
 
 res <- results(dds, contrast <- contrast)
-res <- merge(data.frame(res), annoFile, by.x = 0, by.y = 1, sort = FALSE)
+res <- merge(data.frame(res), annoFile, by.x = 0, by.y = 1, sort = FALSE) # by.x = 0 refers to "GeneID (row_name)", by.y = 1 refers to "Name" column
 
 #Set up some arbitury xlim and ylim cutoffs
 res$padj[res$padj < 10^(-ylim)] <- 10^(-ylim) 
@@ -301,6 +359,14 @@ grid.rect(gp = gpar(fill = NA))
 ```
 
 **load analyzeContrast**
+<br>**input:**<br>
+res<br>
+cutoff_pvalue<br>
+cutoff_LFC<br>
+contrast_name<br>
+annoFile<br>
+**output:**<br> 
+various diagnosis plots
 ```{r}
 analyzeContrast <- function(res, cutoff_pvalue = 0.05, cutoff_LFC = 1, contrast_name = '', annoFile = '', raw = TRUE) {
 summaryRes(res, contrast_name = contrast_name, cutoff_pvalue = cutoff_pvalue, cutoff_LFC = cutoff_LFC)
@@ -325,6 +391,16 @@ else {
 }
 ```
 **load analyzeContrast**
+<br>**input:**<br>
+df<br>
+dds<br>
+annoFile<br>
+**output:**<br>
+"\<contrast_name>.rnk" -> genes ranked by log2FoldChange_shrink <br>
+"\<contrast_name>.rnk" -> for GSEA analysis <br>
+"\<contrast_name>.deseq2.xlsx" -> raw DESeq2 output <br>
+"\<contrast_name>.deseq2.sig.FDR.\<x>.LFC.\<x>.xlsx" -> significant DESeq2 output <br>
+"\<contrast_name>.deseq2.csv" -> for developers 
 ```{r}
 generateOutput <- function(df, dds, annoFile) {
   library(dplyr)
@@ -344,9 +420,9 @@ generateOutput <- function(df, dds, annoFile) {
   names(res2_df)[3] <- "lfcSE_raw"
   res2_df <- res2_df[, c(2,3)]
   
-  res_df_combine <- merge(res_df, res2_df, by = 0, sort = F, all.x = T) 
-  res_df_combine <- merge(annoFile, res_df_combine, by.x=1, by.y=1, sort=F, all.y=T)
-  res_df_combine <- merge(res_df_combine, norm_exp, by.x=1, by.y=0, all.x=T, sort=F)
+  res_df_combine <- merge(res_df, res2_df, by = 0, sort = F, all.x = T) # by = 0: row_name, which is GeneID
+  res_df_combine <- merge(annoFile, res_df_combine, by.x=1, by.y=1, sort=F, all.y=T) # by.x = 1 refers to 'Name' column, by.y = 1 refers to "Row.names" column that stores 'GeneID'
+  res_df_combine <- merge(res_df_combine, norm_exp, by.x=1, by.y=0, all.x=T, sort=F) # by.x = 1 refers to "Gene" column, by.y = 0 refers to row_name that stores 'GeneID'
   
   # For GSEA:
   rnk <- subset(res_df_combine, select = c('Name', 'log2FoldChange_shrinked'))
@@ -374,7 +450,7 @@ Run codes below:
 
 # **Step1**: preprocess data: feature_count > df
 ```{r}
-test_data <- 'test_data/counts.gene_id.s0.strict.txt'
+test_data <- 'counts.gene_id.s0.strict.txt'
 res <- dataClean(test_data, count = 1) # filter using count value 1
 df <- res[[1]]
 matrix_cts <- res[[2]] # re-calculated in other functions
@@ -409,6 +485,7 @@ library(DESeq2)
 
 tmp <- log10(counts(dds) + 1)
 hist(tmp, main = 'Histogram of log10(count + 1)', 100) # by default, use non-normalized data by counts function
+unlink(tmp)
 ```
 
 ## Dispersion plot
@@ -430,6 +507,7 @@ plotQC_cluster(dds)
 ```{r}
 tmp <- plotQC_correlation(dds)
 print(tmp)
+unlink(tmp)
 ```
 
 # **Step6:** perform selected DESeq contrast
@@ -438,12 +516,12 @@ print(tmp)
 levels(colData(dds)$sample_condition)
 ```
 
-## **Contrast selected:** "csc_diff" vs "csc"
+## **Contrast selected:** "non_csc_1806" vs "csc_1806"
 ```{r}
 cutoff_pvalue <- 0.05
 cutoff_LFC <- 1
-input_condition <- 'csc'
-target_condition <- 'csc_diff'
+input_condition <- 'csc_1806'
+target_condition <- 'non_csc_1806'
 contrast <- c('sample_condition', target_condition, input_condition)
 contrast_name <- paste(target_condition, '_VS_', input_condition, '(input)', sep = '')
 ```
@@ -515,6 +593,7 @@ table(tmp[[2]])
 Number of significantly down-regulated genes:
 ```{r}
 table(tmp[[3]])
+unlink(tmp) # clean temporary data
 ```
 
 ### P-value distribution
